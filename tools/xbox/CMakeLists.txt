@@ -29,6 +29,11 @@ target_include_directories(xbox_recompiler PUBLIC
     "${XBOX_REC}"
     ${XBOX_REC_INC1} ${XBOX_REC_INC2})
 target_compile_options(xbox_recompiler PUBLIC -w)
+if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
+    target_include_directories(xbox_recompiler PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/msvc")
+    target_compile_definitions(xbox_recompiler PUBLIC NOMINMAX)
+    target_compile_options(xbox_recompiler PUBLIC /EHsc)
+endif()
 find_package(Threads REQUIRED)
 target_link_libraries(xbox_recompiler PUBLIC Threads::Threads)
 

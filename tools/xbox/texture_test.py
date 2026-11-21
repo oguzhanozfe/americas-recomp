@@ -1,4 +1,4 @@
-"""Verify nearest-neighbor texture sampling with perspective-correct fragment UVs."""
+"""Verify texture sampling with perspective-correct fragment UVs."""
 import argparse
 import math
 from pathlib import Path
@@ -42,11 +42,25 @@ def color(x, y):
     return ((x + 1) / 4, (y + 1) / 4, (y * WIDTH + x + 1) / 16, 1.0)
 
 
-def verify(image):
+def bilinear_color(u, v):
+    x, y = u * WIDTH - 0.5, v * HEIGHT - 0.5
+    x0, y0 = math.floor(x), math.floor(y)
+    fx, fy = x - x0, y - y0
+    result = [0.0] * 4
+    for row, wy in ((y0, 1 - fy), (y0 + 1, fy)):
+        for col, wx in ((x0, 1 - fx), (x0 + 1, fx)):
+            texel = color(max(0, min(WIDTH - 1, col)), max(0, min(HEIGHT - 1, row)))
+            for i, value in enumerate(texel):
+                result[i] += wx * wy * value
+    return tuple(result)
+
+
+def verify(image, bilinear=False):
     if len(image) != SIZE * SIZE * 16:
         raise ValueError(f"unexpected RGBA32F byte count: {len(image)}")
     hits = set()
     covered = 0
+    max_error = 0.0
     for i, rgba in enumerate(struct.iter_unpack("<4f", image)):
         y, x = divmod(i, SIZE)
         b = (x + 0.5 - 4) / 24
@@ -61,11 +75,18 @@ def verify(image):
             tx = max(0, min(WIDTH - 1, math.floor(u * WIDTH)))
             ty = max(0, min(HEIGHT - 1, math.floor(v * HEIGHT)))
             hits.add((tx, ty))
-            expected = color(tx, ty)
-        if rgba != expected:
+            expected = bilinear_color(u, v) if bilinear else color(tx, ty)
+        if bilinear and expected != CLEAR:
+            errors = [abs(actual - want) for actual, want in zip(rgba, expected)]
+            if not all(math.isfinite(error) and error <= 0.002 for error in errors):
+                raise ValueError(f"pixel ({x}, {y}): expected {expected}, read {rgba}")
+            max_error = max(max_error, *errors)
+        elif rgba != expected:
             raise ValueError(f"pixel ({x}, {y}): expected {expected}, read {rgba}")
     if len(hits) != WIDTH * HEIGHT:
         raise ValueError(f"triangle exercised only {len(hits)} texture cells")
+    if bilinear:
+        print(f"Bilinear maximum absolute channel error: {max_error:.8g}")
     print(f"PASS: {covered} textured, {SIZE * SIZE - covered} clear, {len(hits)} texels")
 
 
@@ -73,7 +94,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--exec", type=Path,
                         default=Path(__file__).resolve().parents[2] / "build-xbox" / "exec.exe")
-    runner = parser.parse_args().exec.resolve()
+    parser.add_argument("--bilinear", action="store_true", help="request guest linear min/mag filtering")
+    args = parser.parse_args()
+    runner = args.exec.resolve()
+    filter_word = (1 << 20) | (1 << 22) if args.bilinear else 0
     compiler = shutil.which("glslangValidator")
     if not runner.is_file() or compiler is None:
         parser.error("provide the built --exec runner and add glslangValidator to PATH")
@@ -86,10 +110,10 @@ def main():
         (work / "texture.bin").write_bytes(b"".join(struct.pack("<4f", *c) for c in texels))
         (work / "scenario.txt").write_text(
             f"stage ps\nwave 32\ntarget {SIZE} {SIZE}\ninputaddr 0x2\ninterp 1 0\n"
-            f"image 1 {WIDTH} {HEIGHT} init texture.bin\nregion 0 256\ntimg 0 0 1\npoke 0 32 0x92\nuser 4 0\n"
+            f"image 1 {WIDTH} {HEIGHT} init texture.bin\nregion 0 256\ntimg 0 0 1\npoke 0 32 0x92\npoke 0 40 {filter_word}\nuser 4 0\n"
             "vs uv.spv\ncode sample.bin\nexport 0 9 0xe4\nout out\n", encoding="ascii")
         subprocess.run([runner, "scenario.txt"], cwd=work, check=True, timeout=90)
-        verify((work / "out" / "target0.bin").read_bytes())
+        verify((work / "out" / "target0.bin").read_bytes(), args.bilinear)
 
 
 if __name__ == "__main__":

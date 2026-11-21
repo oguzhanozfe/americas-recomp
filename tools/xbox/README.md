@@ -88,3 +88,20 @@ level zero, and exports the result. The CPU calculates perspective-correct UVs
 at each pixel center and independently selects the nearest texel with clamp-to-edge
 addressing. All 12 texels must appear, all 192 covered pixels must match exactly,
 and all 832 outside pixels must retain the clear value.
+
+Use `python tools/xbox/texture_test.py --bilinear` to select linear minification
+and magnification in the guest sampler. This uses the same triangle, mip level,
+and texture as the nearest test. The CPU shifts UVs to texel centers, clamps the
+four neighbors separately, and weights their RGBA values. The absolute channel
+tolerance is 0.002 to allow for finite filter-weight precision. The background
+must still match the clear value exactly.
+
+To build the guest-sampler runner on Windows, use an x64 Visual Studio developer
+shell with LLVM's clang-cl, CMake, Ninja, and the Vulkan SDK tools on PATH:
+
+```powershell
+git submodule update --init 3rdparty/SPIRV-Headers 3rdparty/Vulkan-Headers
+cmake -S tools/xbox -B build-sampler -G Ninja -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=Release
+cmake --build build-sampler --target exec
+python tools/xbox/texture_test.py --bilinear --exec build-sampler/exec.exe
+```
