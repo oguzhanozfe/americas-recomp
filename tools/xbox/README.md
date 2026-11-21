@@ -76,3 +76,15 @@ installation. For a custom build directory, pass `--exec "path to exec.exe"` to
 the smoke test. It generates a standalone RDNA2 compute program, dispatches one
 32-lane workgroup, and checks all 1024 output bytes. A successful run prints
 `PASS`. This test requires neither a shader corpus nor an external decoder.
+
+### Test texture sampling
+
+With the Vulkan execution harness built and the SDK's `glslangValidator` on PATH,
+run `python tools/xbox/texture_test.py --exec "build-xbox/exec.exe"`.
+
+A GLSL vertex shader supplies UVs and unequal clip-space W. An RDNA2 fragment
+program interpolates U and V, samples a generated 4 by 3 RGBA32F texture at mip
+level zero, and exports the result. The CPU calculates perspective-correct UVs
+at each pixel center and independently selects the nearest texel with clamp-to-edge
+addressing. All 12 texels must appear, all 192 covered pixels must match exactly,
+and all 832 outside pixels must retain the clear value.
