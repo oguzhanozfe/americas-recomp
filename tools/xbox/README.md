@@ -4,7 +4,9 @@ Experimental tooling for running Xbox Series shader code through the shader reco
 
 1. `build_msvc.py` builds the recompiler and the tools below with MSVC (run it from PowerShell/cmd). On Linux,
    `cmake -S tools/xbox -B build-xbox -DCMAKE_BUILD_TYPE=Release && cmake --build build-xbox` builds `driver`, `stages` and `exec`
-   (needs the `SPIRV-Headers` and `Vulkan-Headers` submodules and the Vulkan loader). Without `rdna2.py`, `rdna_asm.py` takes its opcode
+   (needs the `SPIRV-Headers` and `Vulkan-Headers` submodules; `exec` opens the Vulkan loader at run time, as the AGC driver does).
+   When a device address does not fit in the 48 bits of a guest pointer (RADV hands out such addresses), `exec` gives the regions remapped
+   guest addresses as `lowguest` does. Without `rdna2.py`, `rdna_asm.py` takes its opcode
    tables from LLVM (`rdna2_llvm.py`, needs `llvm-mc` with the AMDGPU target), so `exec_tests.py` and `exec_bvh_tests.py` run with no
    game files: `XBOX_EXEC=build-xbox/exec python3 tools/xbox/exec_tests.py`. `VK_DRIVER_FILES=<icd.json>` picks the GPU.
 2. `extract_shaders.py` writes prologue-stripped, trimmed code blobs `<idx>.bin` (it depends on the RPF9
@@ -16,9 +18,16 @@ Experimental tooling for running Xbox Series shader code through the shader reco
 6. `exec.exe <scenario.txt>` is the execution harness: it recompiles a compute shader against REAL Vulkan device memory, dispatches it on the
    host GPU and writes the memory regions (and images) back. Build it on Windows with `build_msvc.py --with-exec`.
    `rdna_asm.py` assembles small RDNA2 test programs (opcode numbers come from the decoder tables; each program is decoded back to check it),
-   `exec_tests.py` and `exec_bvh_tests.py` hold the tests. Set `XBOX_EXEC` to the `exec.exe` path. Supported: guest buffers, shader data,
-   flattened SRT, identity BDA page table and fault reporting, 2D RGBA32F images, samplers. Pixel shaders (`stage ps`, see the pixel smoke test): one triangle over
-   a single RGBA32F target. Not yet: other image formats/dimensions, image tables, texel buffers, other graphics stages.
+   `exec_tests.py`, `exec_bvh_tests.py` and `image_tests.py` hold the tests. Set `XBOX_EXEC` to the `exec.exe` path. Supported: guest
+   buffers, shader data, flattened SRT, identity BDA page table and fault reporting, single-level linear 1D, 2D, 2D array and 3D images in
+   any format the AGC driver maps and the device can sample (`image <id> <w> <h> format <n> dim 1d|2d|3d depth <d>`), T#s encoded with the
+   AGC driver's `EncodeTextureResource`, samplers built from the guest S# with its `DecodeSamplerResource`, pixel shaders (`stage ps`).
+   Scenario lines added for this: `image <id> <w> <h> [format <IMG_FORMAT>] [dim 1d|2d|3d] [depth <d>] [layers <n>] [clear r g b a]
+   [init <file>]` (default format 77, 32_32_32_32_FLOAT; init files hold raw texels in the image format, row-major, slice after slice;
+   clear values are integers for UINT/SINT formats; read back as `out/image<id>.bin` in the image format) and `timg <region> <offset>
+   <image>`, which writes the image's linear T#. Not yet: block-compressed and cube images, mip levels, image tables, texel buffers,
+   other graphics stages. On Linux `exec` links six
+   AGC driver and libc sources for this (see `CMakeLists.txt`); an MSVC build of `exec` needs the same files.
 
 ## Pixel smoke test
 

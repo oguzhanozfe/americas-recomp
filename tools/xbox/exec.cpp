@@ -7,13 +7,10 @@
 //   region <id> <bytes> [init <file>]   (a device-address buffer; its address is real)
 //   poke <id> <byteOffset> <u32>        ptrlo <id> <byteOffset> <targetId> [addBytes]
 //   ptrhi <id> <byteOffset> <targetId> <orMask>     ((address >> 32) & 0xffff) | orMask
-//   image <id> <width> <height> [clear r g b a] [init <file>]    (an R32G32B32A32_SFLOAT 2D image; it gets a fake 256-aligned guest address)
-//   timg <regionId> <byteOffset> <imageId>          (writes an 8-dword 2D RGBA32F T# for the image into a region)
 //   user <sgpr> <targetId>              (user data pair: low, high dword of the region address)
 //   userval <sgpr> <u32>
 //   user32 <sgpr> <targetId>   (a single 32-bit pointer register: the guest address of the region)
-//   lowguest   (give every region a guest address below 4 GiB; the BDA page table maps guest to device addresses; implied when a device
-//               address does not fit in 48 bits, as RADV hands out)
+//   lowguest   (give every region a guest address below 4 GiB; the BDA page table maps guest to device addresses)
 //   stage ps   (a pixel shader instead of a compute shader: draws one triangle that covers the whole target; the vertex shader
 //               comes from `vs <spv>` and writes constant interpolants; colour outputs are read back as out/target<i>.bin, RGBA32F)
 //   export <target> <mode> <mapping>   (SPI_SHADER_COL_FORMAT-style output mode, default 4 = FP16_ABGR; mapping default 0xe4 = identity)
@@ -21,10 +18,13 @@
 //   target <w> <h>    inputaddr <hex>    interp <count> <fp16 attribute mask hex>
 //   threads <x> <y> <z>   (workgroup size, default <wave> 1 1)     lds <dwords>     userdwords <n>   (user SGPR count; the workgroup ids follow)
 // Supported bindings: guest buffers (V# bases must be region starts), shader data, flattened SRT, GDS/page-table/fault stubs.
-// Images and samplers are not implemented yet and make the run fail with a clear message.
 #include "Recompiler.hpp"
 #include "BdaAbi.hpp"
-#include <vulkan/vulkan.h>
+#include "vulkan_loader.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestSamplerResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
+#include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -62,8 +62,16 @@ struct ImageRes {
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
     std::uint32_t layers = 1;   // > 1 makes a 2D array image
-    float clear[4] = {0, 0, 0, 0};
-    std::string initFile;   // raw R32G32B32A32 float texels, row-major; replaces the clear value
+    std::uint32_t depth = 1;
+    std::uint32_t format = 77;
+    AgcDriver::Graphics::TextureDimension dimension = AgcDriver::Graphics::TextureDimension::k2D;
+    VkFormat vkFormat = VK_FORMAT_R32G32B32A32_SFLOAT;
+    std::uint32_t bytesPerTexel = 16;
+    bool integer = false;
+    bool storage = false;
+    std::string clear[4] = {"0", "0", "0", "0"};
+    std::string initFile;
+    std::map<int, VkImageView> views;
 };
 
 struct Device {
@@ -74,6 +82,8 @@ struct Device {
     std::uint32_t family = 0;
     VkPhysicalDeviceMemoryProperties memory{};
     VkPhysicalDeviceVulkan13Properties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
+    bool samplerAnisotropy = false;
+    float maxSamplerAnisotropy = 1.0f;
     PFN_vkGetBufferDeviceAddress getAddress = nullptr;
 };
 
@@ -112,7 +122,9 @@ Device CreateDevice(std::uint32_t wave, bool bary) {
     app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
+    LoadVulkanLoader();
     VK(vkCreateInstance(&ici, nullptr, &d.instance));
+    LoadVulkanInstance(d.instance);
     std::uint32_t count = 0;
     vkEnumeratePhysicalDevices(d.instance, &count, nullptr);
     std::vector<VkPhysicalDevice> devices(count);
@@ -141,6 +153,10 @@ Device CreateDevice(std::uint32_t wave, bool bary) {
     if (bary) f13.pNext = &fbary;
     vkGetPhysicalDeviceFeatures2(d.physical, &f2);
     if (bary && !fbary.fragmentShaderBarycentric) throw std::runtime_error("the device has no VK_KHR_fragment_shader_barycentric");
+    d.samplerAnisotropy = f2.features.samplerAnisotropy == VK_TRUE;
+    VkPhysicalDeviceProperties limits{};
+    vkGetPhysicalDeviceProperties(d.physical, &limits);
+    d.maxSamplerAnisotropy = limits.limits.maxSamplerAnisotropy;
     const float priority = 1.0f;
     VkDeviceQueueCreateInfo qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qi.queueFamilyIndex = d.family;
@@ -165,6 +181,55 @@ std::vector<char> ReadFile(const std::string& path) {
 }
 
 std::uint64_t Num(const std::string& s) { return std::stoull(s, nullptr, 0); }
+
+VkImageView ImageView(const Device& dev, ImageRes& im, VkImageViewType type) {
+    const auto found = im.views.find(static_cast<int>(type));
+    if (found != im.views.end()) return found->second;
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vi.image = im.image; vi.viewType = type; vi.format = im.vkFormat;
+    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, im.layers};
+    VkImageView view;
+    VK(vkCreateImageView(dev.device, &vi, nullptr, &view));
+    im.views.emplace(static_cast<int>(type), view);
+    return view;
+}
+
+VkImageViewType ViewTypeFor(DescriptorImageShape shape, const ImageRes& im) {
+    using AgcDriver::Graphics::TextureDimension;
+    switch (shape) {
+        case DescriptorImageShape::Image1D: if (im.dimension == TextureDimension::k1D) return VK_IMAGE_VIEW_TYPE_1D; break;
+        case DescriptorImageShape::Image1DArray: if (im.dimension == TextureDimension::k1D) return VK_IMAGE_VIEW_TYPE_1D_ARRAY; break;
+        case DescriptorImageShape::Image2D: if (im.dimension == TextureDimension::k2D) return VK_IMAGE_VIEW_TYPE_2D; break;
+        case DescriptorImageShape::Image2DArray: if (im.dimension == TextureDimension::k2D || im.dimension == TextureDimension::k2DArray) return VK_IMAGE_VIEW_TYPE_2D_ARRAY; break;
+        case DescriptorImageShape::Image3D: if (im.dimension == TextureDimension::k3D) return VK_IMAGE_VIEW_TYPE_3D; break;
+        default: break;
+    }
+    throw std::runtime_error("image " + std::to_string(im.id) + ": the shader binds it with shape " + std::to_string(static_cast<int>(shape)) + ", which the harness cannot view it as");
+}
+
+std::array<std::uint32_t, 8> EncodeImage(const ImageRes& im) {
+    using AgcDriver::Graphics::TextureDimension;
+    AgcDriver::Graphics::GuestTextureResource t{};
+    t.baseAddress = im.fakeAddress; t.width = im.width; t.height = im.height; t.mipCount = 1; t.samples = 1;
+    t.tileMode = AgcDriver::Graphics::TextureTileMode::kLinear; t.format = im.format;
+    t.dstSelX = 4; t.dstSelY = 5; t.dstSelZ = 6; t.dstSelW = 7;
+    std::array<std::uint32_t, 8> words{};
+    if (im.dimension == TextureDimension::k2D || im.dimension == TextureDimension::k2DArray) {
+        t.dimension = im.dimension;
+        t.depthOrLastArray = im.layers - 1;
+        words = AgcDriver::Graphics::EncodeTextureResource(t);
+    } else {
+        t.dimension = TextureDimension::k2D;
+        words = AgcDriver::Graphics::EncodeTextureResource(t);
+        words[3] = (words[3] & 0x0fffffffu) | ((im.dimension == TextureDimension::k1D ? 8u : 10u) << 28);
+        words[4] = (words[4] & ~0x1fffu) | (im.depth - 1);
+    }
+    const auto back = AgcDriver::Graphics::DecodeTextureResource(words);
+    const auto wantDepth = im.dimension == TextureDimension::k3D ? im.depth - 1 : im.layers - 1;
+    if (back.baseAddress != im.fakeAddress || back.width != im.width || back.height != im.height || back.format != im.format || back.dimension != im.dimension || back.depthOrLastArray != wantDepth)
+        throw std::runtime_error("image " + std::to_string(im.id) + ": the T# does not decode back to the image");
+    return words;
+}
 
 }  // namespace
 
@@ -237,14 +302,45 @@ int main(int argc, char** argv) {
             im.id = static_cast<std::uint32_t>(Num(l.w[1]));
             im.width = static_cast<std::uint32_t>(Num(l.w[2])); im.height = static_cast<std::uint32_t>(Num(l.w[3]));
             im.fakeAddress = 0x7000000000ull + 0x1000000ull * im.id;
-            if (l.w.size() >= 9 && l.w[4] == "clear") for (int c = 0; c < 4; ++c) im.clear[c] = std::stof(l.w[5 + c]);
-            for (std::size_t k = 4; k + 1 < l.w.size(); ++k) if (l.w[k] == "init") im.initFile = l.w[k + 1];
-            for (std::size_t k = 4; k + 1 < l.w.size(); ++k) if (l.w[k] == "layers") im.layers = static_cast<std::uint32_t>(Num(l.w[k + 1]));
+            for (std::size_t k = 4; k < l.w.size(); ++k) {
+                const bool more = k + 1 < l.w.size();
+                if (l.w[k] == "clear" && k + 4 < l.w.size()) { for (int c = 0; c < 4; ++c) im.clear[c] = l.w[k + 1 + c]; k += 4; }
+                else if (l.w[k] == "init" && more) im.initFile = l.w[++k];
+                else if (l.w[k] == "layers" && more) im.layers = static_cast<std::uint32_t>(Num(l.w[++k]));
+                else if (l.w[k] == "depth" && more) im.depth = static_cast<std::uint32_t>(Num(l.w[++k]));
+                else if (l.w[k] == "format" && more) im.format = static_cast<std::uint32_t>(Num(l.w[++k]));
+                else if (l.w[k] == "dim" && more) {
+                    const auto& d = l.w[++k];
+                    using AgcDriver::Graphics::TextureDimension;
+                    if (d == "1d") im.dimension = TextureDimension::k1D;
+                    else if (d == "2d") im.dimension = TextureDimension::k2D;
+                    else if (d == "3d") im.dimension = TextureDimension::k3D;
+                    else throw std::runtime_error("image " + l.w[1] + ": unknown dim " + d + " (1d, 2d, 3d; 2D arrays use layers)");
+                }
+                else throw std::runtime_error("image " + l.w[1] + ": unknown option " + l.w[k]);
+            }
+            using AgcDriver::Graphics::TextureDimension;
+            if (im.layers > 1 && im.dimension != TextureDimension::k2D) throw std::runtime_error("image " + l.w[1] + ": layers are implemented for 2D images only");
+            if (im.layers > 1) im.dimension = TextureDimension::k2DArray;
+            if (im.dimension != TextureDimension::k3D && im.depth != 1) throw std::runtime_error("image " + l.w[1] + ": depth needs dim 3d");
+            if (im.dimension == TextureDimension::k1D && im.height != 1) throw std::runtime_error("image " + l.w[1] + ": a 1D image has height 1");
+            if (AgcDriver::Graphics::IsBlockCompressed(im.format)) throw std::runtime_error("image " + l.w[1] + ": block-compressed formats are not implemented in the harness");
+            im.vkFormat = AgcDriver::Graphics::ResolveTextureFormat(im.format);
+            im.bytesPerTexel = AgcDriver::Graphics::BytesPerElement(im.format);
+            const auto numeric = SampledTextureNumericClass(static_cast<IrBufferFormat>(im.format));
+            if (numeric == IrTextureNumericClass::Unsupported) throw std::runtime_error("image " + l.w[1] + ": format " + std::to_string(im.format) + " has no sampled numeric class");
+            im.integer = numeric != IrTextureNumericClass::Float;
+            VkFormatProperties fp{};
+            vkGetPhysicalDeviceFormatProperties(dev.physical, im.vkFormat, &fp);
+            const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+            if ((fp.optimalTilingFeatures & need) != need) throw std::runtime_error("image " + l.w[1] + ": the device cannot sample and copy format " + std::to_string(im.format));
+            im.storage = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
             VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-            ici.imageType = VK_IMAGE_TYPE_2D; ici.format = VK_FORMAT_R32G32B32A32_SFLOAT;
-            ici.extent = {im.width, im.height, 1}; ici.mipLevels = 1; ici.arrayLayers = im.layers; ici.samples = VK_SAMPLE_COUNT_1_BIT;
+            ici.imageType = im.dimension == TextureDimension::k1D ? VK_IMAGE_TYPE_1D : im.dimension == TextureDimension::k3D ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+            ici.format = im.vkFormat;
+            ici.extent = {im.width, im.height, im.depth}; ici.mipLevels = 1; ici.arrayLayers = im.layers; ici.samples = VK_SAMPLE_COUNT_1_BIT;
             ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-            ici.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            ici.usage = (im.storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0u) | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
             ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             VK(vkCreateImage(dev.device, &ici, nullptr, &im.image));
             VkMemoryRequirements req{};
@@ -253,10 +349,8 @@ int main(int argc, char** argv) {
             ai.allocationSize = req.size; ai.memoryTypeIndex = FindMemory(dev, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
             VK(vkAllocateMemory(dev.device, &ai, nullptr, &im.memory));
             VK(vkBindImageMemory(dev.device, im.image, im.memory, 0));
-            VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-            vi.image = im.image; vi.viewType = im.layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D; vi.format = ici.format;
-            vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, im.layers};
-            VK(vkCreateImageView(dev.device, &vi, nullptr, &im.view));
+            const VkImageViewType own = im.dimension == TextureDimension::k1D ? VK_IMAGE_VIEW_TYPE_1D : im.dimension == TextureDimension::k3D ? VK_IMAGE_VIEW_TYPE_3D : im.layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+            im.view = ImageView(dev, im, own);
         }
         const auto region = [&](const std::string& id) -> Region& {
             const auto it = regions.find(static_cast<std::uint32_t>(Num(id)));
@@ -276,13 +370,8 @@ int main(int argc, char** argv) {
                 const ImageRes& im = it->second;
                 Region& r = region(l.w[1]);
                 const auto off = Num(l.w[2]);
-                // word0 base>>8; word1 base_hi | format 77 (32_32_32_32_FLOAT; 56 would be 8_8_8_8_UNORM) << 20 | 3 << 30; word2 (w-1) | (h-1) << 14; word3 identity swizzle | type 2D (9) << 28
-                dword(r, off) = static_cast<std::uint32_t>(im.fakeAddress >> 8);
-                dword(r, off + 4) = static_cast<std::uint32_t>((im.fakeAddress >> 40) & 0xffu) | (77u << 20) | (3u << 30);
-                dword(r, off + 8) = (im.width - 1) | ((im.height - 1) << 14);
-                dword(r, off + 12) = 0xfacu | ((im.layers > 1 ? 13u : 9u) << 28);   // type 9 = 2D, 13 = 2D array
-                for (int k = 4; k < 8; ++k) dword(r, off + 4 * k) = 0;
-                if (im.layers > 1) dword(r, off + 16) = im.layers - 1;   // depth field: last array slice
+                const auto words = EncodeImage(im);
+                for (int k = 0; k < 8; ++k) dword(r, off + 4 * k) = words[k];
             }
             else if (l.w[0] == "poke") dword(region(l.w[1]), Num(l.w[2])) = static_cast<std::uint32_t>(Num(l.w[3]));
             else if (l.w[0] == "ptrlo") dword(region(l.w[1]), Num(l.w[2])) = static_cast<std::uint32_t>(region(l.w[3]).guest + (l.w.size() > 4 ? Num(l.w[4]) : 0));
@@ -382,16 +471,30 @@ int main(int argc, char** argv) {
                     ii.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
                     if (b.kind == DescriptorKind::Sampler) {
                         VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-                        sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
-                        sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-                        sci.maxLod = 16.0f;
+                        VkSamplerReductionModeCreateInfo reduction{VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO};
+                        if (b.guestDescriptor.size() >= (e + 1) * 4u) {
+                            const auto ss = AgcDriver::Graphics::DecodeSamplerResource(std::span<const std::uint32_t>(b.guestDescriptor).subspan(e * 4, 4), e < b.samplerUnnormalized.size() && b.samplerUnnormalized[e], false, e < b.samplerIntegerBorder.size() && b.samplerIntegerBorder[e]);
+                            sci.magFilter = ss.magFilter; sci.minFilter = ss.minFilter; sci.mipmapMode = ss.mipmapMode;
+                            sci.addressModeU = ss.addressModeU; sci.addressModeV = ss.addressModeV; sci.addressModeW = ss.addressModeW;
+                            sci.anisotropyEnable = ss.anisotropyEnable && dev.samplerAnisotropy; sci.maxAnisotropy = std::min(ss.maxAnisotropy, dev.maxSamplerAnisotropy);
+                            sci.minLod = ss.minLod; sci.maxLod = ss.maxLod; sci.mipLodBias = ss.lodBias; sci.borderColor = ss.borderColor;
+                            sci.compareEnable = ss.compareEnable; sci.compareOp = ss.compareOp; sci.unnormalizedCoordinates = ss.unnormalizedCoordinates;
+                            if (ss.reductionMode != VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE) { reduction.reductionMode = ss.reductionMode; sci.pNext = &reduction; }
+                        } else {
+                            sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
+                            sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+                            sci.maxLod = 16.0f;
+                        }
                         VK(vkCreateSampler(dev.device, &sci, nullptr, &ii.sampler));
                     } else {
-                        const std::uint64_t base = (static_cast<std::uint64_t>(b.guestDescriptor[e * 8]) << 8) | (static_cast<std::uint64_t>(b.guestDescriptor[e * 8 + 1] & 0xffu) << 40);
+                        const auto words = std::span<const std::uint32_t>(b.guestDescriptor).subspan(e * 8, 8);
+                        const std::uint64_t base = AgcDriver::Graphics::IsNullTextureResource(words) ? 0 : AgcDriver::Graphics::DecodeTextureResource(words).baseAddress;
                         ImageRes* found = nullptr;
-                        for (auto& [iid, im] : images) if (im.fakeAddress == base) found = &im;
+                        for (auto& [iid, im] : images) if (iid != 9999 && im.fakeAddress == base) found = &im;
                         if (found == nullptr) found = &images.at(9999);
-                        ii.imageView = found->view;
+                        if (b.kind == DescriptorKind::StorageImage && !found->storage) throw std::runtime_error("binding " + std::to_string(b.binding) + ": the device has no storage support for image format " + std::to_string(found->format));
+                        const auto shape = e < b.imageShapes.size() ? std::optional<DescriptorImageShape>(b.imageShapes[e]) : b.imageShape;
+                        ii.imageView = shape ? ImageView(dev, *found, ViewTypeFor(*shape, *found)) : found->view;
                     }
                     imageInfos[bi].push_back(ii);
                 }
@@ -556,13 +659,18 @@ int main(int argc, char** argv) {
                 std::ifstream in(im.initFile, std::ios::binary);
                 if (!in) throw std::runtime_error("cannot open image init file " + im.initFile);
                 staging.emplace_back();
-                MakeBuffer(dev, staging.back(), static_cast<std::uint64_t>(im.width) * im.height * 16 * im.layers, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                MakeBuffer(dev, staging.back(), static_cast<std::uint64_t>(im.width) * im.height * im.depth * im.bytesPerTexel * im.layers, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
                 in.read(static_cast<char*>(staging.back().mapped), static_cast<std::streamsize>(staging.back().size));
+                if (static_cast<std::uint64_t>(in.gcount()) != staging.back().size) throw std::runtime_error("image init file " + im.initFile + " holds " + std::to_string(in.gcount()) + " bytes, the image " + std::to_string(staging.back().size));
                 VkBufferImageCopy up{};
-                up.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, im.layers}; up.imageExtent = {im.width, im.height, 1};
+                up.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, im.layers}; up.imageExtent = {im.width, im.height, im.depth};
                 vkCmdCopyBufferToImage(cmd, staging.back().buffer, im.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &up);
             } else {
-                VkClearColorValue color{}; std::memcpy(color.float32, im.clear, sizeof(im.clear));
+                VkClearColorValue color{};
+                for (int c = 0; c < 4; ++c) {
+                    if (im.integer) color.int32[c] = static_cast<std::int32_t>(std::stoll(im.clear[c], nullptr, 0));
+                    else color.float32[c] = std::stof(im.clear[c]);
+                }
                 VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, im.layers};
                 vkCmdClearColorImage(cmd, im.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1, &range);
             }
@@ -663,11 +771,11 @@ int main(int argc, char** argv) {
         std::map<std::uint32_t, Region> readback;
         for (auto& [iid, im] : images) {
             Region& rb = readback[iid];
-            MakeBuffer(dev, rb, static_cast<std::uint64_t>(im.width) * im.height * 16 * im.layers, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            MakeBuffer(dev, rb, static_cast<std::uint64_t>(im.width) * im.height * im.depth * im.bytesPerTexel * im.layers, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
             vkCmdPipelineBarrier(cmd, pixel ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
             VkBufferImageCopy copy{};
-            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, im.layers}; copy.imageExtent = {im.width, im.height, 1};
+            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, im.layers}; copy.imageExtent = {im.width, im.height, im.depth};
             vkCmdCopyImageToBuffer(cmd, im.image, VK_IMAGE_LAYOUT_GENERAL, rb.buffer, 1, &copy);
         }
         VK(vkEndCommandBuffer(cmd));
