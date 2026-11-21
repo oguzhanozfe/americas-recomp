@@ -18,7 +18,14 @@ Experimental tooling for running Xbox Series shader code through the shader reco
 6. `exec.exe <scenario.txt>` is the execution harness: it recompiles a compute shader against REAL Vulkan device memory, dispatches it on the
    host GPU and writes the memory regions (and images) back. Build it like `driver.exe` plus the Vulkan SDK include path and `vulkan-1.lib`.
    `rdna_asm.py` assembles small RDNA2 test programs (opcode numbers come from the decoder tables; each program is decoded back to check it),
-   `exec_tests.py` and `exec_bvh_tests.py` hold the tests. Set `XBOX_EXEC` to the `exec.exe` path. Supported: guest buffers, shader data,
-   flattened SRT, identity BDA page table and fault reporting, 2D RGBA32F images, samplers. Not yet: other image formats/dimensions, image
-   tables, texel buffers, graphics stages.
+   `exec_tests.py`, `exec_bvh_tests.py` and `image_tests.py` hold the tests. Set `XBOX_EXEC` to the `exec.exe` path. Supported: guest
+   buffers, shader data, flattened SRT, identity BDA page table and fault reporting, single-level linear 1D, 2D, 2D array and 3D images in
+   any format the AGC driver maps and the device can sample (`image <id> <w> <h> format <n> dim 1d|2d|3d depth <d>`), T#s encoded with the
+   AGC driver's `EncodeTextureResource`, samplers built from the guest S# with its `DecodeSamplerResource`, pixel shaders (`stage ps`).
+   Scenario lines added for this: `image <id> <w> <h> [format <IMG_FORMAT>] [dim 1d|2d|3d] [depth <d>] [layers <n>] [clear r g b a]
+   [init <file>]` (default format 77, 32_32_32_32_FLOAT; init files hold raw texels in the image format, row-major, slice after slice;
+   clear values are integers for UINT/SINT formats; read back as `out/image<id>.bin` in the image format) and `timg <region> <offset>
+   <image>`, which writes the image's linear T#. Not yet: block-compressed and cube images, mip levels, image tables, texel buffers,
+   other graphics stages. On Linux `exec` links six
+   AGC driver and libc sources for this (see `CMakeLists.txt`); an MSVC build of `exec` needs the same files.
 

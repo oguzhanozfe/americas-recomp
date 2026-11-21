@@ -37,6 +37,13 @@ target_link_libraries(driver PRIVATE xbox_recompiler)
 add_executable(stages stages.cpp)
 target_link_libraries(stages PRIVATE xbox_recompiler)
 
-add_executable(exec exec.cpp)
-target_include_directories(exec PRIVATE "${XBOX_ROOT}/3rdparty/Vulkan-Headers/include")
+set(XBOX_AGC "${XBOX_ROOT}/core/libs/prx/libSceAgcDriver/Graphics/src")
+add_executable(exec exec.cpp
+    "${XBOX_AGC}/GuestSamplerResource.cpp"
+    "${XBOX_AGC}/GuestTextureResource.cpp"
+    "${XBOX_AGC}/RuntimeSwitches.cpp"
+    "${XBOX_AGC}/TextureFormat.cpp"
+    "${XBOX_AGC}/TextureTiling.cpp"
+    "${XBOX_ROOT}/core/libs/prx/libc/src/RunReport.cpp")
+target_include_directories(exec PRIVATE "${XBOX_ROOT}/3rdparty/Vulkan-Headers/include" "${XBOX_ROOT}/core")
 target_link_libraries(exec PRIVATE xbox_recompiler ${CMAKE_DL_LIBS})
